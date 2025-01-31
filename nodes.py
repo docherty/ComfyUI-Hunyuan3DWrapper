@@ -6,7 +6,6 @@ from pathlib import Path
 import numpy as np
 import json
 import trimesh
-from tqdm import tqdm
 
 from .hy3dgen.shapegen import Hunyuan3DDiTFlowMatchingPipeline, FaceReducer, FloaterRemover, DegenerateFaceRemover
 from .hy3dgen.texgen.hunyuanpaint.unet.modules import UNet2DConditionModel, UNet2p5DConditionModel
@@ -143,9 +142,6 @@ class DownloadAndLoadHy3DDelightModel:
             "required": {
                 "model": (["hunyuan3d-delight-v2-0"],),
             },
-            "optional": {
-                "compile_args": ("HY3DCOMPILEARGS", {"tooltip": "torch.compile settings, when connected to the model loader, torch.compile of the selected models is attempted. Requires Triton and torch 2.5.0 is recommended"}),
-            }
         }
 
     RETURN_TYPES = ("HY3DDIFFUSERSPIPE",)
@@ -153,8 +149,9 @@ class DownloadAndLoadHy3DDelightModel:
     FUNCTION = "loadmodel"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def loadmodel(self, model, compile_args=None):
+    def loadmodel(self, model):
         device = mm.get_torch_device()
+        offload_device = mm.unet_offload_device()
 
         download_path = os.path.join(folder_paths.models_dir,"diffusers")
         model_path = os.path.join(download_path, model)
@@ -178,17 +175,7 @@ class DownloadAndLoadHy3DDelightModel:
         )
         delight_pipe.scheduler = EulerAncestralDiscreteScheduler.from_config(delight_pipe.scheduler.config)
         delight_pipe = delight_pipe.to(device, torch.float16)
-
-        
-
-        if compile_args is not None:
-            torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
-            if compile_args["compile_transformer"]:
-                delight_pipe.unet = torch.compile(delight_pipe.unet)
-            if compile_args["compile_vae"]:
-                delight_pipe.vae = torch.compile(delight_pipe.vae)
-        else:
-            delight_pipe.enable_model_cpu_offload()
+        delight_pipe.enable_model_cpu_offload()
         
         return (delight_pipe,)
         
@@ -202,7 +189,8 @@ class Hy3DDelightImage:
                 "steps": ("INT", {"default": 50, "min": 1}),
                 "width": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 16}),
                 "height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 16}),
-                "cfg_image": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01}),
+                "cfg_image": ("FLOAT", {"default": 1.5, "min": 0.0, "max": 100.0, "step": 0.01}),
+                "cfg_text": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 100.0, "step": 0.01}),
                 "seed": ("INT", {"default": 42, "min": 0, "max": 0xffffffffffffffff}),
         },
         "optional": {
@@ -215,7 +203,7 @@ class Hy3DDelightImage:
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, delight_pipe, image, width, height, cfg_image, steps, seed, scheduler=None):
+    def process(self, delight_pipe, image, width, height, cfg_image, cfg_text, steps, seed, scheduler=None):
 
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
@@ -238,7 +226,7 @@ class Hy3DDelightImage:
             width=width,
             num_inference_steps=steps,
             image_guidance_scale=cfg_image,
-            guidance_scale=1.0 if cfg_image == 1.0 else 1.01, #enable cfg for image, value doesn't matter as it do anything for text anyway
+            guidance_scale=cfg_text,
             output_type="pt",
             
         ).images[0]
@@ -254,9 +242,6 @@ class DownloadAndLoadHy3DPaintModel:
             "required": {
                 "model": (["hunyuan3d-paint-v2-0"],),
             },
-            "optional": {
-                "compile_args": ("HY3DCOMPILEARGS", {"tooltip": "torch.compile settings, when connected to the model loader, torch.compile of the selected models is attempted. Requires Triton and torch 2.5.0 is recommended"}),
-            }
         }
 
     RETURN_TYPES = ("HY3DDIFFUSERSPIPE",)
@@ -264,7 +249,7 @@ class DownloadAndLoadHy3DPaintModel:
     FUNCTION = "loadmodel"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def loadmodel(self, model, compile_args=None):
+    def loadmodel(self, model):
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
@@ -325,16 +310,8 @@ class DownloadAndLoadHy3DPaintModel:
             scheduler=scheduler,
             feature_extractor=feature_extractor,
             )
-        
-        if compile_args is not None:
-            pipeline.to(device)
-            torch._dynamo.config.cache_size_limit = compile_args["dynamo_cache_size_limit"]
-            if compile_args["compile_transformer"]:
-                pipeline.unet = torch.compile(pipeline.unet)
-            if compile_args["compile_vae"]:
-                pipeline.vae = torch.compile(pipeline.vae)
-        else:
-            pipeline.enable_model_cpu_offload()
+
+        pipeline.enable_model_cpu_offload()
         return (pipeline,)
 
 #region Texture
@@ -346,8 +323,11 @@ class Hy3DCameraConfig:
                 "camera_azimuths": ("STRING", {"default": "0, 90, 180, 270, 0, 180", "multiline": False}),
                 "camera_elevations": ("STRING", {"default": "0, 0, 0, 0, 90, -90", "multiline": False}),
                 "view_weights": ("STRING", {"default": "1, 0.1, 0.5, 0.1, 0.05, 0.05", "multiline": False}),
-                "camera_distance": ("FLOAT", {"default": 1.45, "min": 0.1, "max": 10.0, "step": 0.001}),
-                "ortho_scale": ("FLOAT", {"default": 1.2, "min": 0.1, "max": 10.0, "step": 0.001}),
+                "camera_distances": ("STRING", {"default": "1.45, 1.45, 1.45, 1.45, 1.45, 1.45", "multiline": False}),
+                "ortho_scales": ("STRING", {"default": "1.2, 1.2, 1.2, 1.2, 1.2, 1.2", "multiline": False}),
+                "camera_x_offsets": ("STRING", {"default": "0, 0, 0, 0, 0, 0", "multiline": False, "tooltip": "X offset of camera in meters"}),
+                "camera_y_offsets": ("STRING", {"default": "0, 0, 0, 0, 0, 0", "multiline": False, "tooltip": "Y offset of camera in meters"}),
+                "camera_z_offsets": ("STRING", {"default": "0, 0, 0, 0, 0, 0", "multiline": False, "tooltip": "Z offset of camera in meters"}),
             },
         }
 
@@ -356,18 +336,38 @@ class Hy3DCameraConfig:
     FUNCTION = "process"
     CATEGORY = "Hunyuan3DWrapper"
 
-    def process(self, camera_azimuths, camera_elevations, view_weights, camera_distance, ortho_scale):
+    def process(self, camera_azimuths, camera_elevations, view_weights, camera_distances, ortho_scales,
+                camera_x_offsets, camera_y_offsets, camera_z_offsets):
         angles_list = list(map(int, camera_azimuths.replace(" ", "").split(',')))
         elevations_list = list(map(int, camera_elevations.replace(" ", "").split(',')))
         weights_list = list(map(float, view_weights.replace(" ", "").split(',')))
+        distances_list = list(map(float, camera_distances.replace(" ", "").split(',')))
+        scales_list = list(map(float, ortho_scales.replace(" ", "").split(',')))
+        x_offsets_list = list(map(float, camera_x_offsets.replace(" ", "").split(',')))
+        y_offsets_list = list(map(float, camera_y_offsets.replace(" ", "").split(',')))
+        z_offsets_list = list(map(float, camera_z_offsets.replace(" ", "").split(',')))
+
+        # Validate that all lists have the same length
+        list_lengths = [len(angles_list), len(elevations_list), len(weights_list), 
+                       len(distances_list), len(scales_list), len(x_offsets_list),
+                       len(y_offsets_list), len(z_offsets_list)]
+        if len(set(list_lengths)) != 1:
+            raise ValueError("All input lists must have the same length. Got lengths: " + 
+                           f"azimuths={list_lengths[0]}, elevations={list_lengths[1]}, " +
+                           f"weights={list_lengths[2]}, distances={list_lengths[3]}, " +
+                           f"scales={list_lengths[4]}, x_offsets={list_lengths[5]}, " +
+                           f"y_offsets={list_lengths[6]}, z_offsets={list_lengths[7]}")
 
         camera_config = {
             "selected_camera_azims": angles_list,
             "selected_camera_elevs": elevations_list,
             "selected_view_weights": weights_list,
-            "camera_distance": camera_distance,
-            "ortho_scale": ortho_scale,
-            }
+            "camera_distances": distances_list,
+            "ortho_scales": scales_list,
+            "camera_x_offsets": x_offsets_list,
+            "camera_y_offsets": y_offsets_list,
+            "camera_z_offsets": z_offsets_list,
+        }
         
         return (camera_config,)
     
@@ -412,35 +412,44 @@ class Hy3DRenderMultiView:
     CATEGORY = "Hunyuan3DWrapper"
 
     def process(self, mesh, render_size, texture_size, camera_config=None, normal_space="world"):
-
         from .hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
 
         if camera_config is None:
             selected_camera_azims = [0, 90, 180, 270, 0, 180]
             selected_camera_elevs = [0, 0, 0, 0, 90, -90]
-            camera_distance = 1.45
-            ortho_scale = 1.2
+            camera_distances = [1.45] * 6
+            ortho_scales = [1.2] * 6
+            self.camera_x_offsets = [0] * 6
+            self.camera_y_offsets = [0] * 6
+            self.camera_z_offsets = [0] * 6
         else:
             selected_camera_azims = camera_config["selected_camera_azims"]
             selected_camera_elevs = camera_config["selected_camera_elevs"]
-            camera_distance = camera_config["camera_distance"]
-            ortho_scale = camera_config["ortho_scale"]
-        
+            camera_distances = camera_config["camera_distances"]
+            ortho_scales = camera_config["ortho_scales"]
+            self.camera_x_offsets = camera_config.get("camera_x_offsets", [0] * len(selected_camera_azims))
+            self.camera_y_offsets = camera_config.get("camera_y_offsets", [0] * len(selected_camera_azims))
+            self.camera_z_offsets = camera_config.get("camera_z_offsets", [0] * len(selected_camera_azims))
+
+        # Initialize with default settings
+        # Store the mesh and create initial renderer
+        self.mesh = mesh
         self.render = MeshRender(
             default_resolution=render_size,
             texture_size=texture_size,
-            camera_distance=camera_distance,
-            ortho_scale=ortho_scale)
-
-        self.render.load_mesh(mesh)
+            camera_distance=1.45,
+            ortho_scale=1.2)
+        self.render.load_mesh(self.mesh)
 
         if normal_space == "world":
             normal_maps = self.render_normal_multiview(
-                selected_camera_elevs, selected_camera_azims, use_abs_coor=True)
+                selected_camera_elevs, selected_camera_azims, camera_distances, ortho_scales,
+                use_abs_coor=True)
             normal_tensors = torch.stack(normal_maps, dim=0)
         elif normal_space == "tangent":
             normal_maps = self.render_normal_multiview(
-                selected_camera_elevs, selected_camera_azims, bg_color=[0, 0, 0], use_abs_coor=False)
+                selected_camera_elevs, selected_camera_azims, camera_distances, ortho_scales,
+                bg_color=[0, 0, 0], use_abs_coor=False)
             normal_tensors = torch.stack(normal_maps, dim=0)
             normal_tensors = 2.0 * normal_tensors - 1.0  # Map [0,1] to [-1,1]
             normal_tensors = normal_tensors / (torch.norm(normal_tensors, dim=-1, keepdim=True) + 1e-6)
@@ -450,27 +459,81 @@ class Hy3DRenderMultiView:
             image[..., 1] = normal_tensors[..., 1]  # View up to G
             image[..., 2] = -normal_tensors[..., 2] # View forward (negated) to B
             normal_tensors = (image + 1) * 0.5
-        
+
         position_maps = self.render_position_multiview(
-            selected_camera_elevs, selected_camera_azims)
+            selected_camera_elevs, selected_camera_azims, camera_distances, ortho_scales)
         position_tensors = torch.stack(position_maps, dim=0)
         
         return (normal_tensors, position_tensors, self.render,)
     
-    def render_normal_multiview(self, camera_elevs, camera_azims, use_abs_coor=True, bg_color=[1, 1, 1]):
+    def render_normal_multiview(self, camera_elevs, camera_azims, camera_distances, ortho_scales, use_abs_coor=True, bg_color=[1, 1, 1]):
+        from .hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
         normal_maps = []
-        for elev, azim in zip(camera_elevs, camera_azims):
-            normal_map, _ = self.render.render_normal(
-                elev, azim, bg_color=bg_color, use_abs_coor=use_abs_coor, return_type='th')
+        for i in range(len(camera_elevs)):
+            elev = camera_elevs[i]
+            azim = camera_azims[i]
+            dist = camera_distances[i]
+            scale = ortho_scales[i]
+            
+            # Convert camera offset to coordinates
+            x_offset = self.camera_x_offsets[i] if hasattr(self, 'camera_x_offsets') else 0
+            y_offset = self.camera_y_offsets[i] if hasattr(self, 'camera_y_offsets') else 0
+            z_offset = self.camera_z_offsets[i] if hasattr(self, 'camera_z_offsets') else 0
+
+            center = [x_offset, y_offset, z_offset] if any([x_offset, y_offset, z_offset]) else None
+            
+            print(f"Normal render {i}: elev={elev}, azim={azim}, dist={dist}, scale={scale}, center={center}")
+            
+            # Create a fresh renderer instance for this view
+            renderer = MeshRender(
+                default_resolution=self.render.default_resolution,
+                texture_size=self.render.texture_size,
+                camera_distance=dist,
+                ortho_scale=scale)
+            renderer.load_mesh(self.mesh)
+            
+            normal_map, _ = renderer.render_normal(
+                elev, azim,
+                camera_distance=dist,
+                center=center,
+                bg_color=bg_color,
+                use_abs_coor=use_abs_coor,
+                return_type='th')
             normal_maps.append(normal_map)
 
         return normal_maps
 
-    def render_position_multiview(self, camera_elevs, camera_azims):
+    def render_position_multiview(self, camera_elevs, camera_azims, camera_distances, ortho_scales):
+        from .hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
         position_maps = []
-        for elev, azim in zip(camera_elevs, camera_azims):
-            position_map = self.render.render_position(
-                elev, azim, return_type='th')
+        for i in range(len(camera_elevs)):
+            elev = camera_elevs[i]
+            azim = camera_azims[i]
+            dist = camera_distances[i]
+            scale = ortho_scales[i]
+            
+            # Convert camera offset to coordinates
+            x_offset = self.camera_x_offsets[i] if hasattr(self, 'camera_x_offsets') else 0
+            y_offset = self.camera_y_offsets[i] if hasattr(self, 'camera_y_offsets') else 0
+            z_offset = self.camera_z_offsets[i] if hasattr(self, 'camera_z_offsets') else 0
+
+            center = [x_offset, y_offset, z_offset] if any([x_offset, y_offset, z_offset]) else None
+            
+            print(f"Position render {i}: elev={elev}, azim={azim}, dist={dist}, scale={scale}, center={center}")
+            
+            # Create a fresh renderer instance for this view
+            renderer = MeshRender(
+                default_resolution=self.render.default_resolution,
+                texture_size=self.render.texture_size,
+                camera_distance=dist,
+                ortho_scale=scale)
+            renderer.load_mesh(self.mesh)
+            
+            position_map = renderer.render_position(
+                elev, azim,
+                camera_distance=dist,
+                center=center,
+                return_type='th')
             position_maps.append(position_map)
 
         return position_maps
@@ -559,20 +622,26 @@ class Hy3DRenderSingleView:
         
         return (final_image,)
     
-    def render_normal_multiview(self, camera_elevs, camera_azims, use_abs_coor=True):
+    def render_normal_multiview(self, camera_elevs, camera_azims, camera_distances, ortho_scales, use_abs_coor=True, bg_color=[1, 1, 1]):
         normal_maps = []
-        for elev, azim in zip(camera_elevs, camera_azims):
+        for i, (elev, azim, dist, scale) in enumerate(zip(camera_elevs, camera_azims, camera_distances, ortho_scales)):
+            # Set the current ortho_scale in the renderer
+            self.render.ortho_scale = scale
             normal_map, _ = self.render.render_normal(
-                elev, azim, use_abs_coor=use_abs_coor, return_type='th')
+                elev, azim, camera_distance=dist,
+                bg_color=bg_color, use_abs_coor=use_abs_coor, return_type='th')
             normal_maps.append(normal_map)
 
         return normal_maps
 
-    def render_position_multiview(self, camera_elevs, camera_azims):
+    def render_position_multiview(self, camera_elevs, camera_azims, camera_distances, ortho_scales):
         position_maps = []
-        for elev, azim in zip(camera_elevs, camera_azims):
+        for i, (elev, azim, dist, scale) in enumerate(zip(camera_elevs, camera_azims, camera_distances, ortho_scales)):
+            # Set the current ortho_scale in the renderer
+            self.render.ortho_scale = scale
             position_map = self.render.render_position(
-                elev, azim, return_type='th')
+                elev, azim, camera_distance=dist,
+                return_type='th')
             position_maps.append(position_map)
 
         return position_maps
@@ -597,44 +666,44 @@ class Hy3DRenderMultiViewDepth:
     CATEGORY = "Hunyuan3DWrapper"
 
     def process(self, mesh, render_size, texture_size, camera_config=None):
-
-        mm.unload_all_models()
-        mm.soft_empty_cache()
-
         from .hy3dgen.texgen.differentiable_renderer.mesh_render import MeshRender
 
         if camera_config is None:
             selected_camera_azims = [0, 90, 180, 270, 0, 180]
             selected_camera_elevs = [0, 0, 0, 0, 90, -90]
-            camera_distance = 1.45
-            ortho_scale = 1.2
+            camera_distances = [1.45] * 6  # Default distance for each view
+            ortho_scales = [1.2] * 6  # Default scale for each view
         else:
             selected_camera_azims = camera_config["selected_camera_azims"]
             selected_camera_elevs = camera_config["selected_camera_elevs"]
-            camera_distance = camera_config["camera_distance"]
-            ortho_scale = camera_config["ortho_scale"]
+            camera_distances = camera_config["camera_distances"]
+            ortho_scales = camera_config["ortho_scales"]
 
+        # Initialize with first view's settings
         self.render = MeshRender(
             default_resolution=render_size,
             texture_size=texture_size,
-            camera_distance=camera_distance,
-            ortho_scale=ortho_scale)
+            camera_distance=camera_distances[0],
+            ortho_scale=ortho_scales[0])
 
         self.render.load_mesh(mesh)
 
-       
-
         depth_maps = self.render_depth_multiview(
-            selected_camera_elevs, selected_camera_azims)
+            selected_camera_elevs, selected_camera_azims, camera_distances, ortho_scales)
         depth_tensors = torch.stack(depth_maps, dim=0)
         depth_tensors = depth_tensors.repeat(1, 1, 1, 3)
         
         return (depth_tensors,)
     
-    def render_depth_multiview(self, camera_elevs, camera_azims):
+    def render_depth_multiview(self, camera_elevs, camera_azims, camera_distances, ortho_scales):
         depth_maps = []
-        for elev, azim in zip(camera_elevs, camera_azims):        
-            depth_map = self.render.render_depth(elev, azim, return_type='th')
+        for elev, azim, dist, scale in zip(camera_elevs, camera_azims, camera_distances, ortho_scales):
+            # Set the current ortho_scale in the renderer
+            self.render.ortho_scale = scale
+            depth_map = self.render.render_depth(
+                elev, azim,
+                camera_distance=dist,
+                return_type='th')
             depth_maps.append(depth_map)
 
         return depth_maps
@@ -730,9 +799,34 @@ class Hy3DSampleMultiView:
             selected_camera_azims = camera_config["selected_camera_azims"]
             selected_camera_elevs = camera_config["selected_camera_elevs"]
         
-        camera_info = [(((azim // 30) + 9) % 12) // {-90: 3, -45: 2, -20: 1, 0: 1, 20: 1, 45: 2, 90: 3}[
-            elev] + {-90: 36, -45: 30, -20: 0, 0: 12, 20: 24, 45: 30, 90: 40}[elev] for azim, elev in
-                    zip(selected_camera_azims, selected_camera_elevs)]
+        def get_elev_factor(elev):
+            # Map any elevation to a factor between 1 and 3
+            abs_elev = abs(elev)
+            if abs_elev <= 20:
+                return 1
+            elif abs_elev <= 45:
+                return 2
+            else:
+                return 3
+
+        def get_elev_offset(elev):
+            # Map elevation ranges to specific offsets
+            abs_elev = abs(elev)
+            if abs_elev <= 20:
+                return 12 if elev >= 0 else 0
+            elif abs_elev <= 45:
+                return 24 if elev >= 0 else 0
+            elif abs_elev <= 90:
+                return 36 if elev >= 0 else 40
+            else:
+                # For any other elevation, map to closest range
+                if elev >= 0:
+                    return 36
+                else:
+                    return 40
+
+        camera_info = [(((azim // 30) + 9) % 12) // get_elev_factor(elev) + get_elev_offset(elev)
+                       for azim, elev in zip(selected_camera_azims, selected_camera_elevs)]
         print(camera_info)
         
         normal_maps_np = (normal_maps * 255).to(torch.uint8).cpu().numpy()
@@ -812,10 +906,24 @@ class Hy3DBakeFromMultiview:
             selected_camera_azims = [0, 90, 180, 270, 0, 180]
             selected_camera_elevs = [0, 0, 0, 0, 90, -90]
             selected_view_weights = [1, 0.1, 0.5, 0.1, 0.05, 0.05]
+            camera_distances = [1.45] * 6
+            camera_x_offsets = [0] * 6
+            camera_y_offsets = [0] * 6
+            camera_z_offsets = [0] * 6
         else:
             selected_camera_azims = camera_config["selected_camera_azims"]
             selected_camera_elevs = camera_config["selected_camera_elevs"]
             selected_view_weights = camera_config["selected_view_weights"]
+            camera_distances = camera_config["camera_distances"]
+            camera_x_offsets = camera_config.get("camera_x_offsets", [0] * len(selected_camera_azims))
+            camera_y_offsets = camera_config.get("camera_y_offsets", [0] * len(selected_camera_azims))
+            camera_z_offsets = camera_config.get("camera_z_offsets", [0] * len(selected_camera_azims))
+
+        # Store camera parameters in renderer for back_project to use
+        self.render.camera_distances = camera_distances
+        self.render.camera_x_offsets = camera_x_offsets
+        self.render.camera_y_offsets = camera_y_offsets
+        self.render.camera_z_offsets = camera_z_offsets
 
         merge_method = 'fast'
         self.bake_exp = 4
@@ -835,10 +943,28 @@ class Hy3DBakeFromMultiview:
         project_textures, project_weighted_cos_maps = [], []
         project_boundary_maps = []
         pbar = ProgressBar(len(views))
-        for view, camera_elev, camera_azim, weight in zip(
-            views, camera_elevs, camera_azims, view_weights):
+        
+        # Get camera parameters from config if available
+        camera_distances = getattr(self.render, 'camera_distances', [1.45] * len(views))
+        camera_x_offsets = getattr(self.render, 'camera_x_offsets', [0] * len(views))
+        camera_y_offsets = getattr(self.render, 'camera_y_offsets', [0] * len(views))
+        camera_z_offsets = getattr(self.render, 'camera_z_offsets', [0] * len(views))
+        
+        for i, (view, camera_elev, camera_azim, weight) in enumerate(
+            zip(views, camera_elevs, camera_azims, view_weights)):
+            
+            # Prepare camera parameters
+            dist = camera_distances[i]
+            center = None
+            if any([camera_x_offsets[i], camera_y_offsets[i], camera_z_offsets[i]]):
+                center = [camera_x_offsets[i], camera_y_offsets[i], camera_z_offsets[i]]
+            
+            print(f"Baking view {i}: elev={camera_elev}, azim={camera_azim}, dist={dist}, center={center}")
+            
             project_texture, project_cos_map, project_boundary_map = self.render.back_project(
-                view, camera_elev, camera_azim)
+                view, camera_elev, camera_azim,
+                camera_distance=dist,
+                center=center)
             project_cos_map = weight * (project_cos_map ** self.bake_exp)
             project_textures.append(project_texture)
             project_weighted_cos_maps.append(project_cos_map)
@@ -995,9 +1121,6 @@ class Hy3DGenerateMesh:
 
     def process(self, pipeline, image, steps, guidance_scale, seed, mask=None):
 
-        mm.unload_all_models()
-        mm.soft_empty_cache()
-
         device = mm.get_torch_device()
         offload_device = mm.unet_offload_device()
 
@@ -1149,8 +1272,7 @@ class Hy3DFastSimplifyMesh:
             max_iterations=max_iterations,
             preserve_border=preserve_border, 
             verbose=True,
-            lossless=lossless,
-            threshold_lossless=threshold_lossless
+            lossless=lossless
             )
         new_mesh.vertices, new_mesh.faces, _ = mesh_simplifier.getMesh()
         log.info(f"Simplified mesh to {target_count} vertices, resulting in {new_mesh.vertices.shape[0]} vertices and {new_mesh.faces.shape[0]} faces")   
@@ -1357,150 +1479,6 @@ class Hy3DExportMesh:
         relative_path = Path(subfolder) / f'{filename}_{counter:05}_.glb'
         
         return (str(relative_path), )
-    
-class Hy3DNvdiffrastRenderer:
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "mesh": ("HY3DMESH",),
-                "render_type": (["textured", "vertex_colors", "normals","depth",],),
-                "width": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 16, "tooltip": "Width of the rendered image"}),
-                "height": ("INT", {"default": 512, "min": 64, "max": 4096, "step": 16, "tooltip": "Height of the rendered image"}),
-                "ssaa": ("INT", {"default": 1, "min": 1, "max": 8, "step": 1, "tooltip": "Super-sampling anti-aliasing"}),
-                "num_frames": ("INT", {"default": 30, "min": 1, "max": 1000, "step": 1, "tooltip": "Number of frames to render"}),
-                "camera_distance": ("FLOAT", {"default": 2.0, "min": -100.1, "max": 1000.0, "step": 0.01, "tooltip": "Camera distance from the object"}),
-                "yaw": ("FLOAT", {"default": 0.0, "min": -90.0, "max": 90.0, "step": 0.01, "tooltip": "Start yaw in radians"}),
-                "pitch": ("FLOAT", {"default": 0.0, "min": -180.0, "max": 180.0, "step": 0.01, "tooltip": "Start pitch in radians"}),
-                "fov": ("FLOAT", {"default": 60.0, "min": 1.0, "max": 179.0, "step": 0.01, "tooltip": "Camera field of view in degrees"}),
-                "near": ("FLOAT", {"default": 0.1, "min": 0.001, "max": 1000.0, "step": 0.01, "tooltip": "Camera near clipping plane"}),
-                "far": ("FLOAT", {"default": 1000.0, "min": 1.0, "max": 10000.0, "step": 0.01, "tooltip": "Camera far clipping plane"}),
-            },
-        }
-
-    RETURN_TYPES = ("IMAGE", "MASK",)
-    RETURN_NAMES = ("image", "mask")
-    FUNCTION = "render"
-    CATEGORY = "Hunyuan3DWrapper"
-
-    def render(self, mesh, width, height, camera_distance, yaw, pitch, fov, near, far, num_frames, ssaa, render_type):
-        try:
-            import nvdiffrast.torch as dr
-        except ImportError:
-            raise ImportError("nvdiffrast not found. Please install it https://github.com/NVlabs/nvdiffrast")
-        try:
-            from .utils import rotate_mesh_matrix, yaw_pitch_r_fov_to_extrinsics_intrinsics, intrinsics_to_projection
-        except ImportError:
-            raise ImportError("utils3d not found. Please install it 'pip install git+https://github.com/EasternJournalist/utils3d.git#egg=utils3d'")
-        # Create GL context
-        device = mm.get_torch_device()
-        glctx = dr.RasterizeCudaContext()
-        mesh_copy = mesh.copy()
-        mesh_copy = rotate_mesh_matrix(mesh_copy, 90, 'x')
-        mesh_copy = rotate_mesh_matrix(mesh_copy, 180, 'z')
-
-        width, height = width * ssaa, height * ssaa
-
-        # Get UV coordinates and texture if available
-        if hasattr(mesh_copy.visual, 'uv') and hasattr(mesh_copy.visual, 'material'):
-            uvs = torch.tensor(mesh_copy.visual.uv, dtype=torch.float32, device=device).contiguous()
-            
-            # Get texture from material
-            if hasattr(mesh_copy.visual.material, 'baseColorTexture'):
-                pil_texture = getattr(mesh_copy.visual.material, "baseColorTexture")
-                pil_texture = pil_texture.transpose(Image.FLIP_TOP_BOTTOM)
-
-                # Convert PIL to tensor [B,C,H,W]
-                transform = transforms.Compose([
-                    transforms.ToTensor(),
-                ])
-                texture = transform(pil_texture).to(device)
-                texture = texture.unsqueeze(0).permute(0, 2, 3, 1).contiguous() #need to be contiguous for nvdiffrast
-        else:
-            print("No texture found")
-            # Fallback to vertex colors if no texture
-            uvs = None
-            texture = None
-        
-        # Get vertices and faces from trimesh
-        vertices = torch.tensor(mesh_copy.vertices, dtype=torch.float32, device=device).unsqueeze(0)
-        faces = torch.tensor(mesh_copy.faces, dtype=torch.int32, device=device)
-        
-        yaws = torch.linspace(yaw, yaw + torch.pi * 2, num_frames) 
-        pitches = [pitch] * num_frames
-        yaws = yaws.tolist()
-
-        r = camera_distance
-        extrinsics, intrinsics = yaw_pitch_r_fov_to_extrinsics_intrinsics(yaws, pitches,  r, fov)
-        
-        image_list = []
-        mask_list = []
-        pbar = ProgressBar(num_frames)
-        for j, (extr, intr) in tqdm(enumerate(zip(extrinsics, intrinsics)), desc='Rendering', disable=False):
-            
-            perspective = intrinsics_to_projection(intr, near, far)
-            RT = extr.unsqueeze(0)
-            full_proj = (perspective @ extr).unsqueeze(0)
-            
-            # Transform vertices to clip space
-            vertices_homo = torch.cat([vertices, torch.ones_like(vertices[..., :1])], dim=-1)
-            vertices_camera = torch.bmm(vertices_homo, RT.transpose(-1, -2))
-            vertices_clip = torch.bmm(vertices_homo, full_proj.transpose(-1, -2))
-            
-            # Rasterize with proper shape [batch=1, num_vertices, 4]
-            rast_out, _ = dr.rasterize(glctx, vertices_clip, faces, (height, width))
-            
-            if render_type == "textured":
-                if uvs is not None and texture is not None:
-                    # Interpolate UV coordinates
-                    uv_attr, _= dr.interpolate(uvs.unsqueeze(0), rast_out, faces)
-                    
-                    # Sample texture using interpolated UVs
-                    image = dr.texture(tex=texture, uv=uv_attr)
-                    image = dr.antialias(image, rast_out, vertices_clip, faces)
-                else:
-                    raise Exception("No texture found")
-            elif render_type == "vertex_colors":
-                # Fallback to vertex color rendering
-                vertex_colors = (vertices - vertices.min()) / (vertices.max() - vertices.min())
-                image = dr.interpolate(vertex_colors, rast_out, faces)[0]
-            elif render_type == "depth":
-                depth_values = vertices_camera[..., 2:3].contiguous()
-                depth_values = (depth_values - depth_values.min()) / (depth_values.max() - depth_values.min())
-                depth_values = 1 - depth_values
-                image = dr.interpolate(depth_values, rast_out, faces)[0]
-                image = dr.antialias(image, rast_out, vertices_clip, faces)
-            elif "normals" in render_type:
-                normals_tensor = torch.tensor(mesh_copy.vertex_normals, dtype=torch.float32, device=device).contiguous()
-                faces_tensor = torch.tensor(mesh_copy.faces, dtype=torch.int32, device=device).contiguous()
-                normal_image_tensors = dr.interpolate(normals_tensor, rast_out, faces_tensor)[0]
-                normal_image_tensors = dr.antialias(normal_image_tensors, rast_out, vertices_clip, faces)
-                normal_image_tensors = torch.nn.functional.normalize(normal_image_tensors, dim=-1)
-                image = (normal_image_tensors + 1) * 0.5
-
-            # Create background color
-            background_color = torch.zeros((1, height, width, 3), device=device)
-            
-            # Get alpha mask from rasterization
-            mask = rast_out[..., -1:]
-            mask = (mask > 0).float()
-            
-            # Blend rendered image with background
-            image = image * mask + background_color * (1 - mask)
-
-            image_list.append(image)
-            mask_list.append(mask)
-            
-            pbar.update(1)
-        import torch.nn.functional as F
-        image_out = torch.cat(image_list, dim=0)
-        if ssaa > 1:
-            image_out = F.interpolate(image_out.permute(0, 3, 1, 2), (width, height), mode='bilinear', align_corners=False, antialias=True)
-            image_out = image_out.permute(0, 2, 3, 1)
-        mask_out = torch.cat(mask_list, dim=0).squeeze(-1)
-     
-        
-        return (image_out.cpu().float(), mask_out.cpu().float(),)
 
 NODE_CLASS_MAPPINGS = {
     "Hy3DModelLoader": Hy3DModelLoader,
@@ -1529,8 +1507,7 @@ NODE_CLASS_MAPPINGS = {
     "Hy3DDiffusersSchedulerConfig": Hy3DDiffusersSchedulerConfig,
     "Hy3DIMRemesh": Hy3DIMRemesh,
     "Hy3DMeshInfo": Hy3DMeshInfo,
-    "Hy3DFastSimplifyMesh": Hy3DFastSimplifyMesh,
-    "Hy3DNvdiffrastRenderer": Hy3DNvdiffrastRenderer
+    "Hy3DFastSimplifyMesh": Hy3DFastSimplifyMesh
     }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DModelLoader": "Hy3DModelLoader",
@@ -1559,6 +1536,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "Hy3DDiffusersSchedulerConfig": "Hy3D Diffusers Scheduler Config",
     "Hy3DIMRemesh": "Hy3D Instant-Meshes Remesh",
     "Hy3DMeshInfo": "Hy3D Mesh Info",
-    "Hy3DFastSimplifyMesh": "Hy3D Fast Simplify Mesh",
-    "Hy3DNvdiffrastRenderer": "Hy3D Nvdiffrast Renderer"
+    "Hy3DFastSimplifyMesh": "Hy3D Fast Simplify Mesh"
     }
